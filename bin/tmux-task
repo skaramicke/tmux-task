@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# tmux-task — Claude Code background task manager
+#
+# Runs long commands in tmux, notifies Claude of output at intervals via
+# the Stop hook (hooks/tmux-task-stop.sh).
+#
+# Notifications are scoped to the working directory at the time of `start`,
+# so each Claude project session only sees its own task notifications.
+#
+# Usage:
+#   tmux-task start <id> <interval_secs> [--lines N] <command...>
+#   tmux-task status <id>          — show new output since last check
+#   tmux-task send <id> <input>    — send input to running task (e.g. answer a prompt)
+#   tmux-task kill <id>            — kill task + tmux session
+#   tmux-task interval <id> <N>   — change notification interval live
+#   tmux-task lines <id> <N>      — change lines trigger live (0 = disable)
+#   tmux-task list                 — list running tasks (shows count of completed)
+#   tmux-task clean                — remove completed/killed task records
+
+set -euo pipefail
+
+STATE_DIR="$HOME/.tmux-tasks"
+PENDING_DIR="$STATE_DIR/pending"
+
+# Resolve the real path of this script so _watch can call back into itself
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+mkdir -p "$PENDING_DIR"
+
+# Derive a short scope token from a directory path (sanitise for use as a dir name).
+_scope_for_dir() {
+  local dir="${1:-$PWD}"
+  echo "$dir" | sed 's|^/||; s|/|-|g; s| |_|g'
+}
+
+# Check if a task's tmux session is alive
+_session_alive() {
+  tmux has-session -t "$1" 2>/dev/null
+}
+
+cmd="${1:-help}"
+shift || true
+
+# ---------------------------------------------------------------------------
+# start <id> <interval> [--lines N] <command...>
+# ---------------------------------------------------------------------------
+if [[ "$cmd" == "start" ]]; then
+  id="$1"; interval="$2"; shift 2
+
+  if [[ -z "$interval" || "$interval" == --* ]]; then
+    echo "Error: interval_secs is required." >&2
+    echo "Usage: tmux-task start <id> <interval_secs> [--lines N] <command...>" >&2
+    exit 1
+  fi
+
+  lines_trigger=""
+  if [[ "${1:-}" == "--lines" ]]; then
+    lines_trigger="$2"
+    shift 2
+  fi
+
+  full_cmd="$*"
+  tdir="$STATE_DIR/$id"
+  session="claude-task-$id"
+  scope=$(_scope_for_dir "$PWD")
+
+  mkdir -p "$tdir"
+  mkdir -p "$PENDING_DIR/$scope"
+
+  echo "$session"           > "$tdir/session"
+  echo "$full_cmd"          > "$tdir/command"
+  echo "$interval"          > "$tdir/interval"
+  echo "${lines_trigger:-}" > "$tdir/lines_trigger"
+  echo "$scope"             > "$tdir/scope"
+  echo "0"                  > "$tdir/notif_pos"
+  echo "0"                  > "$tdir/read_pos"
+  echo "running"            > "$tdir/status"
+  : > "$tdir/output.log"
+
+  # Write wrapper so quoting is handled cleanly
+  cat > "$tdir/run.sh" << WRAPPER
+#!/usr/bin/env bash
+$full_cmd 2>&1 | tee "$tdir/output.log"
+WRAPPER
+  chmod +x "$tdir/run.sh"
+
+  # Kill any prior session with same name
+  tmux kill-session -t "$session" 2>/dev/null || true
+
+  # Create detached tmux session with run.sh as the main command.
+  # When run.sh exits the session dies — this is how the watcher detects completion.
+  tmux new-session -d -s "$session" -x 220 -y 50 "bash '$tdir/run.sh'"
+
+  # Start background watcher
+  bash "$SELF" _watch "$id" &
+  echo $! > "$tdir/watcher.pid"
+  disown $! 2>/dev/null || true
+
+  lines_info=""
+  [[ -n "$lines_trigger" ]] && lines_info=", lines-trigger: ${lines_trigger}"
+  echo "Task '$id' started (tmux: $session, interval: ${interval}s${lines_info})"
+  echo "Output log: $tdir/output.log"
+  echo "Watch live: tmux attach -t $session"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# _watch <id>  — internal; run by start as a background process
+#
+# Ticks every 1 second. Two independent triggers both emit notifications:
+#   1. Interval trigger: fires when elapsed >= interval (always, even if no new output)
+#   2. Lines trigger:    fires when new-lines-since-last-notif >= lines_trigger
+# Both triggers reset elapsed and notif_pos so they don't double-fire.
+# ---------------------------------------------------------------------------
+if [[ "$cmd" == "_watch" ]]; then
+  id="$1"
+  tdir="$STATE_DIR/$id"
+  session=$(cat "$tdir/session" 2>/dev/null || echo "claude-task-$id")
+  log="$tdir/output.log"
+  scope=$(cat "$tdir/scope" 2>/dev/null || echo "global")
+  notif_dir="$PENDING_DIR/$scope"
+  mkdir -p "$notif_dir"
+
+  elapsed=0
+
+  _emit_notif() {
+    local label="$1" is_interval="${2:-}"
+    local notif_pos new_bytes new_output suffix
+    notif_pos=$(cat "$tdir/notif_pos" 2>/dev/null || echo 0)
+    new_bytes=$(wc -c < "$log" 2>/dev/null | tr -d ' ' || echo 0)
+
+    if [[ "$label" == "FINISHED" ]]; then
+      new_output=$(tail -30 "$log" 2>/dev/null \
+        | sed 's/\x1b\[[0-9;]*[mGKHFJA-Za-z]//g' || true)
+      suffix="-done"
+    elif [[ "$new_bytes" -gt "$notif_pos" ]]; then
+      new_output=$(tail -c +$((notif_pos + 1)) "$log" 2>/dev/null \
+        | head -c 3000 \
+        | sed 's/\x1b\[[0-9;]*[mGKHFJA-Za-z]//g' || true)
+      suffix=""
+    elif [[ "$is_interval" == "interval" ]]; then
+      new_output="(no new output)"
+      suffix=""
+    else
+      return 0
+    fi
+
+    local notif_file="$notif_dir/$(date +%s%3N)-${id}${suffix}.notif"
+    {
+      if [[ "$label" == "FINISHED" ]]; then
+        echo "[tmux-task '$id'] FINISHED at $(date '+%H:%M:%S'). Task is done — no further notifications will be sent."
+      else
+        echo "[tmux-task '$id' — $(date '+%H:%M:%S')] ${label}"
+      fi
+      echo "$new_output"
+    } > "$notif_file"
+
+    echo "$new_bytes" > "$tdir/notif_pos"
+  }
+
+  while true; do
+    sleep 1
+    elapsed=$((elapsed + 1))
+
+    interval=$(cat "$tdir/interval" 2>/dev/null || echo 30)
+    lines_trigger=$(cat "$tdir/lines_trigger" 2>/dev/null || echo "")
+
+    if ! _session_alive "$session"; then
+      echo "done" > "$tdir/status"
+      _emit_notif "FINISHED"
+      break
+    fi
+
+    # Lines trigger — checked every tick
+    if [[ -n "$lines_trigger" && "$lines_trigger" -gt 0 ]]; then
+      notif_pos=$(cat "$tdir/notif_pos" 2>/dev/null || echo 0)
+      new_bytes=$(wc -c < "$log" 2>/dev/null | tr -d ' ' || echo 0)
+      if [[ "$new_bytes" -gt "$notif_pos" ]]; then
+        new_lines=$(tail -c +$((notif_pos + 1)) "$log" 2>/dev/null \
+          | wc -l | tr -d ' ' || echo 0)
+        if [[ "$new_lines" -ge "$lines_trigger" ]]; then
+          _emit_notif "(lines trigger: ${new_lines} new lines)"
+          elapsed=0
+          continue
+        fi
+      fi
+    fi
+
+    # Interval trigger — always emits even with no new output
+    if [[ "$elapsed" -ge "$interval" ]]; then
+      _emit_notif "" interval
+      elapsed=0
+    fi
+  done
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# status <id>
+# ---------------------------------------------------------------------------
+if [[ "$cmd" == "status" ]]; then
+  id="$1"
+  tdir="$STATE_DIR/$id"
+  [[ -d "$tdir" ]] || { echo "No task with id '$id'"; exit 1; }
+
+  session=$(cat "$tdir/session" 2>/dev/null)
+  log="$tdir/output.log"
+  read_pos=$(cat "$tdir/read_pos" 2>/dev/null || echo 0)
+  new_bytes=$(wc -c < "$log" 2>/dev/null | tr -d ' ' || echo 0)
+
+  if _session_alive "$session"; then task_status="running"; else task_status="done"; fi
+
+  new_output=$(tail -c +$((read_pos + 1)) "$log" 2>/dev/null \
+    | head -c 8000 \
+    | sed 's/\x1b\[[0-9;]*[mGKHFJA-Za-z]//g' || true)
+  echo "$new_bytes" > "$tdir/read_pos"
+
+  echo "=== tmux-task '$id' | $task_status ==="
+  if [[ -n "$new_output" ]]; then
+    echo "$new_output"
+  else
+    echo "(no new output since last check)"
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# send <id> <input>
+# ---------------------------------------------------------------------------
+if [[ "$cmd" == "send" ]]; then
+  id="$1"; shift; input="$*"
+  session=$(cat "$STATE_DIR/$id/session" 2>/dev/null || echo "claude-task-$id")
+  tmux send-keys -t "$session" "$input" Enter
+  echo "Sent to '$id': $input"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# kill <id>
+# ---------------------------------------------------------------------------
+if [[ "$cmd" == "kill" ]]; then
+  id="$1"
+  tdir="$STATE_DIR/$id"
+  session=$(cat "$tdir/session" 2>/dev/null || echo "claude-task-$id")
+  tmux kill-session -t "$session" 2>/dev/null || true
+  watcher_pid=$(cat "$tdir/watcher.pid" 2>/dev/null || true)
+  [[ -n "$watcher_pid" ]] && kill "$watcher_pid" 2>/dev/null || true
+  echo "killed" > "$tdir/status"
+  scope=$(cat "$tdir/scope" 2>/dev/null || _scope_for_dir "$PWD")
+  mkdir -p "$PENDING_DIR/$scope"
+  echo "[tmux-task '$id'] KILLED at $(date '+%H:%M:%S')" \
+    > "$PENDING_DIR/$scope/$(date +%s%3N)-${id}-killed.notif"
+  echo "Task '$id' killed"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# interval <id> <N>
+# ---------------------------------------------------------------------------
+if [[ "$cmd" == "interval" ]]; then
+  id="$1"; new_interval="$2"
+  echo "$new_interval" > "$STATE_DIR/$id/interval"
+  echo "Task '$id' interval updated to ${new_interval}s"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# lines <id> <N>
+# ---------------------------------------------------------------------------
+if [[ "$cmd" == "lines" ]]; then
+  id="$1"; new_lines="$2"
+  echo "$new_lines" > "$STATE_DIR/$id/lines_trigger"
+  if [[ "$new_lines" == "0" ]]; then
+    echo "Task '$id' lines trigger disabled"
+  else
+    echo "Task '$id' lines trigger updated to ${new_lines} lines"
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# list
+# ---------------------------------------------------------------------------
+if [[ "$cmd" == "list" ]]; then
+  echo "=== tmux-tasks ==="
+  running=0
+  done_count=0
+  for d in "$STATE_DIR"/*/; do
+    [[ -d "$d" ]] || continue
+    id=$(basename "$d")
+    [[ "$id" == "pending" ]] && continue
+    session=$(cat "$d/session" 2>/dev/null || echo "?")
+    cmd_text=$(cat "$d/command" 2>/dev/null || echo "?")
+    interval=$(cat "$d/interval" 2>/dev/null || echo "?")
+    lines_trigger=$(cat "$d/lines_trigger" 2>/dev/null || echo "")
+    scope=$(cat "$d/scope" 2>/dev/null || echo "?")
+    lines_info=""
+    [[ -n "$lines_trigger" && "$lines_trigger" != "0" ]] && lines_info="  lines=${lines_trigger}"
+    if _session_alive "$session"; then
+      echo "  [running]  $id  interval=${interval}s${lines_info}  $cmd_text"
+      running=$((running + 1))
+    else
+      done_count=$((done_count + 1))
+    fi
+  done
+  if [[ $running -eq 0 ]]; then
+    echo "  (no running tasks)"
+  fi
+  if [[ $done_count -gt 0 ]]; then
+    echo "  ($done_count completed/killed — run 'tmux-task clean' to remove)"
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# clean — remove completed/killed task records
+# ---------------------------------------------------------------------------
+if [[ "$cmd" == "clean" ]]; then
+  removed=0
+  for d in "$STATE_DIR"/*/; do
+    [[ -d "$d" ]] || continue
+    id=$(basename "$d")
+    [[ "$id" == "pending" ]] && continue
+    session=$(cat "$d/session" 2>/dev/null || echo "")
+    if ! _session_alive "$session"; then
+      rm -rf "$d"
+      echo "  removed: $id"
+      removed=$((removed + 1))
+    fi
+  done
+  [[ $removed -eq 0 ]] && echo "Nothing to clean." || echo "$removed task(s) removed."
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# help / fallthrough
+# ---------------------------------------------------------------------------
+cat << 'HELP'
+tmux-task — Claude Code background task manager
+
+Usage:
+  tmux-task start <id> <interval_secs> [--lines N] <command...>
+  tmux-task status <id>          show new output since last check
+  tmux-task send <id> <input>    send input to running task
+  tmux-task kill <id>            kill task and tmux session
+  tmux-task interval <id> <N>   change notification interval live
+  tmux-task lines <id> <N>      change lines trigger live (0 = disable)
+  tmux-task list                 list running tasks (shows count of completed)
+  tmux-task clean                remove completed/killed task records
+
+Notification triggers (independent — whichever fires first wins):
+  interval_secs  Max seconds between notifications. Always fires even with no
+                 new output, so you know the task is still alive.
+  --lines N      Also notify when N+ new lines appear. Checked every second.
+
+Examples:
+  tmux-task start e2e 60 --lines 5 ./scripts/e2e-test.sh
+  tmux-task start build 120 npm run build
+  tmux-task interval e2e 30
+  tmux-task lines e2e 10
+  tmux-task send e2e y
+  tmux-task kill e2e
+  tmux-task clean
+HELP
