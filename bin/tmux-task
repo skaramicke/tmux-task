@@ -63,7 +63,7 @@ if [[ "$cmd" == "start" ]]; then
     shift 2
   fi
 
-  full_cmd="$*"
+  full_cmd=$(printf '%q ' "$@")
   tdir="$STATE_DIR/$id"
   session="claude-task-$id"
   scope=$(_scope_for_dir "$PWD")
