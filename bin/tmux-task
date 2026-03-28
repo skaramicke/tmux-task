@@ -33,6 +33,10 @@ _scope_for_dir() {
   echo "$dir" | sed 's|^/||; s|/|-|g; s| |_|g'
 }
 
+_millis() {
+  python3 -c 'import time; print(int(time.time() * 1000))'
+}
+
 # Check if a task's tmux session is alive
 _session_alive() {
   tmux has-session -t "$1" 2>/dev/null
@@ -145,7 +149,7 @@ if [[ "$cmd" == "_watch" ]]; then
       return 0
     fi
 
-    local notif_file="$notif_dir/$(date +%s%3N)-${id}${suffix}.notif"
+    local notif_file="$notif_dir/$(_millis)-${id}${suffix}.notif"
     {
       if [[ "$label" == "FINISHED" ]]; then
         echo "[tmux-task '$id'] FINISHED at $(date '+%H:%M:%S'). Task is done — no further notifications will be sent."
@@ -249,7 +253,7 @@ if [[ "$cmd" == "kill" ]]; then
   scope=$(cat "$tdir/scope" 2>/dev/null || _scope_for_dir "$PWD")
   mkdir -p "$PENDING_DIR/$scope"
   echo "[tmux-task '$id'] KILLED at $(date '+%H:%M:%S')" \
-    > "$PENDING_DIR/$scope/$(date +%s%3N)-${id}-killed.notif"
+    > "$PENDING_DIR/$scope/$(_millis)-${id}-killed.notif"
   echo "Task '$id' killed"
   exit 0
 fi
