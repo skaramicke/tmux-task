@@ -12,7 +12,7 @@
 PENDING_DIR="$HOME/.tmux-tasks/pending"
 
 # Derive scope from current working directory (must match _scope_for_dir in tmux-task)
-scope=$(echo "$PWD" | sed 's|^/||; s|/|-|g; s| |_|g')
+scope=$(tmux-task scope "$PWD")
 scope_dir="$PENDING_DIR/$scope"
 
 [[ -d "$scope_dir" ]] || exit 0

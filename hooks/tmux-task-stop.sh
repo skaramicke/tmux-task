@@ -5,7 +5,7 @@ STATE_DIR="$HOME/.tmux-tasks"
 PENDING_DIR="$STATE_DIR/pending"
 LOG="$STATE_DIR/stop-hook.log"
 
-scope=$(echo "$PWD" | sed 's|^/||; s|/|-|g; s| |_|g')
+scope=$(tmux-task scope "$PWD")
 scope_dir="$PENDING_DIR/$scope"
 
 echo "[$(date '+%H:%M:%S')] Stop hook fired. scope=$scope scope_dir_exists=$(test -d "$scope_dir" && echo y || echo n)" >> "$LOG"

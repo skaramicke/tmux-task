@@ -357,6 +357,14 @@ if [[ "$cmd" == "clean" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# scope [dir] — print the scope token for a directory (default: $PWD)
+# ---------------------------------------------------------------------------
+if [[ "$cmd" == "scope" ]]; then
+  _scope_for_dir "${1:-$PWD}"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # help / fallthrough
 # ---------------------------------------------------------------------------
 cat << 'HELP'
@@ -371,6 +379,7 @@ Usage:
   tmux-task lines <id> <N>      change lines trigger live (0 = disable)
   tmux-task list                 list running tasks (shows count of completed)
   tmux-task clean                remove completed/killed task records
+  tmux-task scope [dir]          print scope token for a directory
 
 Notification triggers (independent — whichever fires first wins):
   interval_secs  Max seconds between notifications. Always fires even with no
