@@ -42,6 +42,22 @@ _session_alive() {
   tmux has-session -t "$1" 2>/dev/null
 }
 
+_require_positive_int() {
+  local value="$1" name="$2"
+  if ! [[ "$value" =~ ^[0-9]+$ ]] || [[ "$value" -le 0 ]]; then
+    echo "Error: $name must be a positive integer, got '$value'" >&2
+    exit 1
+  fi
+}
+
+_require_non_negative_int() {
+  local value="$1" name="$2"
+  if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+    echo "Error: $name must be a non-negative integer, got '$value'" >&2
+    exit 1
+  fi
+}
+
 cmd="${1:-help}"
 shift || true
 
@@ -56,10 +72,12 @@ if [[ "$cmd" == "start" ]]; then
     echo "Usage: tmux-task start <id> <interval_secs> [--lines N] <command...>" >&2
     exit 1
   fi
+  _require_positive_int "$interval" "interval_secs"
 
   lines_trigger=""
   if [[ "${1:-}" == "--lines" ]]; then
     lines_trigger="$2"
+    _require_positive_int "$lines_trigger" "lines"
     shift 2
   fi
 
@@ -263,6 +281,7 @@ fi
 # ---------------------------------------------------------------------------
 if [[ "$cmd" == "interval" ]]; then
   id="$1"; new_interval="$2"
+  _require_positive_int "$new_interval" "interval"
   echo "$new_interval" > "$STATE_DIR/$id/interval"
   echo "Task '$id' interval updated to ${new_interval}s"
   exit 0
@@ -273,6 +292,7 @@ fi
 # ---------------------------------------------------------------------------
 if [[ "$cmd" == "lines" ]]; then
   id="$1"; new_lines="$2"
+  _require_non_negative_int "$new_lines" "lines"
   echo "$new_lines" > "$STATE_DIR/$id/lines_trigger"
   if [[ "$new_lines" == "0" ]]; then
     echo "Task '$id' lines trigger disabled"
