@@ -34,7 +34,7 @@ To uninstall: `bash uninstall.sh`
 3. Claude Code's **Stop hook** (`tmux-task-stop.sh`) checks for pending notifications before letting Claude stop — if one exists, it blocks Claude and injects the notification as context
 4. The **UserPromptSubmit/PreToolUse hook** (`tmux-task-notify.sh`) flushes any pending notifications when you send a message
 
-Notifications are **scoped to the working directory**, so each Claude project session only sees notifications from its own tasks.
+Notifications are **scoped to the working directory**, so each Claude project session only sees notifications from its own tasks. A task started from a **subdirectory** (e.g. `cd web && tmux-task start build …` while the session sits at the project root) is still delivered: `start` records the originating absolute path in `~/.tmux-tasks/pending/<scope>/.scopedir`, and the hooks drain every scope whose recorded origin is the session's directory, a descendant, or an ancestor (`tmux-task related-scopes`). Notifs left by an older version with no recorded origin can't be safely attributed, so rather than being dropped silently they are surfaced as a warning naming the scope to drain (`tmux-task orphan-scopes`).
 
 ## Usage
 
